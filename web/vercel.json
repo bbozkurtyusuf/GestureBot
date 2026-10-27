@@ -1,0 +1,9 @@
+{
+  "redirects": [
+    { "source": "/", "destination": "/gesturebot/", "permanent": false }
+  ],
+  "rewrites": [
+    { "source": "/gesturebot", "destination": "/" },
+    { "source": "/gesturebot/:path*", "destination": "/:path*" }
+  ]
+}
