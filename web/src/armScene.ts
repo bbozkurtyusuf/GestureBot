@@ -1,0 +1,617 @@
+/**
+ * Three.js rendering + Rapier physics for the arm and pick-and-place scene.
+ *
+ * The arm itself is kinematic (driven by joint angles from IK, mirroring
+ * the geometry in assets/scene.xml); the cubes are dynamic Rapier bodies.
+ * Grasping is a velocity-driven attachment: when the gripper closes with a
+ * cube between the fingers, the cube stays a *dynamic* body that is
+ * servoed toward its pose in the tool frame every physics substep. It
+ * follows the gripper rigidly in free space, yet still resolves contacts —
+ * driving it into the tray wall or the floor stops it there instead of
+ * tunneling through — which contact-friction grasping in a browser
+ * physics engine cannot deliver without far more tuning.
+ *
+ * Everything lives in a z-up world to match the robot-frame math.
+ */
+
+import RAPIER from "@dimforge/rapier3d-compat";
+import * as THREE from "three";
+
+import { SCENE } from "./config";
+import { CHAIN, fk, type FKResult } from "./kinematics";
+import {
+  matrixFromQuat,
+  matTranspose3,
+  matVec3,
+  orientationError,
+  type Quat,
+  quatConjugate,
+  quatMultiply,
+  quatSlerp,
+  vecAdd,
+  vecClampNorm,
+  type Vec3,
+  vecNorm,
+  vecSub,
+} from "./transforms";
+
+const SHELL = 0xf7f8fa;
+const CYAN = 0x22d3ee;
+const JOINT_LIGHT = 0x2a3038;
+const JOINT_DARK = 0x14181c;
+
+type PaintRole = "shell" | "joint" | "tray";
+
+/** Resolve a theme token to hex. Computed colors may be lab()/oklch(), which Three.Color cannot parse. */
+function tokenHex(name: string, fallback: number): number {
+  if (typeof document === "undefined" || typeof getComputedStyle !== "function") return fallback;
+  const probe = document.createElement("span");
+  probe.style.color = `var(${name})`;
+  document.documentElement.appendChild(probe);
+  const computed = getComputedStyle(probe).color;
+  probe.remove();
+  if (!computed) return fallback;
+  const canvas = document.createElement("canvas");
+  canvas.width = 1;
+  canvas.height = 1;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return fallback;
+  ctx.fillStyle = "#000000";
+  ctx.fillStyle = computed;
+  if (ctx.fillStyle === "#000000" && !/^#000000$/i.test(computed) && !/rgba?\(\s*0\s*,\s*0\s*,\s*0/.test(computed)) {
+    return fallback;
+  }
+  ctx.fillRect(0, 0, 1, 1);
+  const px = ctx.getImageData(0, 0, 1, 1).data;
+  return (px[0] << 16) | (px[1] << 8) | px[2];
+}
+
+function themeIsDark(): boolean {
+  return typeof document !== "undefined" && document.documentElement.classList.contains("dark");
+}
+
+const CUBE_FALLBACK = [0x3b6fd8, 0xd4a24a];
+
+const HELD_MAX_SPEED = 4.0; // m/s the servo may use to catch up to the tool
+const HELD_MAX_ANGVEL = 25.0; // rad/s
+const RELEASE_MAX_SPEED = 1.5; // m/s carried over when the gripper opens
+const HIGHLIGHT_INTENSITY = 0.45;
+const PHYSICS_HZ = 120;
+
+interface Cube {
+  body: RAPIER.RigidBody;
+  mesh: THREE.Mesh;
+  material: THREE.MeshStandardMaterial;
+  held: boolean;
+  /** Cube pose in the tool frame while held. */
+  holdOffset?: { pos: Vec3; quat: Quat };
+}
+
+export class ArmScene {
+  readonly scene = new THREE.Scene();
+  readonly camera: THREE.PerspectiveCamera;
+  private renderer: THREE.WebGLRenderer;
+  private world!: RAPIER.World;
+  private jointGroups: THREE.Group[] = [];
+  private fingerL!: THREE.Mesh;
+  private fingerR!: THREE.Mesh;
+  private shellMats: THREE.MeshStandardMaterial[] = [];
+  private jointMats: THREE.MeshStandardMaterial[] = [];
+  private floorMats: THREE.MeshStandardMaterial[] = [];
+  private trayMats: THREE.MeshStandardMaterial[] = [];
+  private markerMats: THREE.Material[] = [];
+  private ringMat!: THREE.MeshStandardMaterial;
+  private eyeMat!: THREE.MeshStandardMaterial;
+  private hemi!: THREE.HemisphereLight;
+  private targetMarker!: THREE.Mesh;
+  private floorRing!: THREE.Mesh;
+  private dropLine!: THREE.Line;
+  private cubes: Cube[] = [];
+  private q = [0, 0, 0, 0, 0, 0];
+  private grip = 1; // 0 closed .. 1 open
+  private accumulator = 0;
+  private prevF: FKResult | null = null;
+  private candidate: Cube | null = null;
+  private contextLost = false;
+
+  static async create(canvas: HTMLCanvasElement): Promise<ArmScene> {
+    await RAPIER.init();
+    return new ArmScene(canvas);
+  }
+
+  private constructor(canvas: HTMLCanvasElement) {
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.scene.background = new THREE.Color(0x121416);
+    this.scene.fog = new THREE.Fog(0x121416, 2.5, 6);
+    // Surface a dead GPU context as an error the render loop can report,
+    // instead of silently drawing nothing forever.
+    canvas.addEventListener("webglcontextlost", (e) => {
+      e.preventDefault();
+      this.contextLost = true;
+    });
+
+    this.camera = new THREE.PerspectiveCamera(42, 1, 0.05, 20);
+    this.camera.up.set(0, 0, 1); // z-up world
+    this.camera.position.set(1.35, -0.85, 0.75);
+    this.camera.lookAt(0.3, 0, 0.25);
+
+    this.hemi = new THREE.HemisphereLight(0xffffff, 0x1a2a24, 1.0);
+    this.scene.add(this.hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 2.0);
+    dir.position.set(0.5, -0.6, 1.6);
+    dir.castShadow = true;
+    dir.shadow.mapSize.set(2048, 2048);
+    // Tight shadow frustum around the workspace: the default ±5 m box
+    // spends most of the shadow map on empty floor.
+    const sc = dir.shadow.camera;
+    sc.left = -1.2; sc.right = 1.2; sc.top = 1.2; sc.bottom = -1.2;
+    sc.near = 0.1; sc.far = 4;
+    dir.shadow.bias = -0.0005;
+    this.scene.add(dir);
+
+    this.world = new RAPIER.World({ x: 0, y: 0, z: -9.81 });
+    this.world.timestep = 1 / PHYSICS_HZ;
+    this.buildFloor();
+    this.buildArm();
+    this.buildObjects();
+    this.buildMarkers();
+    this.applyTheme();
+  }
+
+  // ---------------- scene construction ----------------
+
+  private buildFloor(): void {
+    // One instanced mesh per checker color: 2 draw calls instead of 256.
+    const n = 8, size = 0.5;
+    const geom = new THREE.PlaneGeometry(size, size);
+    const mats = [0x22262c, 0x2c3138].map((color) => {
+      const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.92, metalness: 0.02 });
+      this.floorMats.push(mat);
+      return mat;
+    });
+    const tiles = mats.map((mat) => {
+      const inst = new THREE.InstancedMesh(geom, mat, 2 * n * n);
+      inst.receiveShadow = true;
+      return inst;
+    });
+    const counts = [0, 0];
+    const m = new THREE.Matrix4();
+    for (let i = -n; i < n; i++) {
+      for (let j = -n; j < n; j++) {
+        const which = (i + j) % 2 ? 0 : 1;
+        m.setPosition((i + 0.5) * size, (j + 0.5) * size, 0);
+        tiles[which].setMatrixAt(counts[which]++, m);
+      }
+    }
+    this.scene.add(...tiles);
+    this.world.createCollider(
+      RAPIER.ColliderDesc.cuboid(4, 4, 0.1).setTranslation(0, 0, -0.1).setFriction(1.0),
+    );
+  }
+
+  private material(role: PaintRole): THREE.MeshStandardMaterial {
+    const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.45, metalness: 0.12 });
+    if (role === "shell") this.shellMats.push(mat);
+    else if (role === "joint") this.jointMats.push(mat);
+    else this.trayMats.push(mat);
+    return mat;
+  }
+
+  private box(w: number, d: number, h: number, role: PaintRole): THREE.Mesh {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, d, h), this.material(role));
+    m.castShadow = true;
+    m.receiveShadow = true;
+    return m;
+  }
+
+  private cylinder(radius: number, height: number, role: PaintRole): THREE.Mesh {
+    const m = new THREE.Mesh(
+      new THREE.CylinderGeometry(radius, radius, height, 32),
+      this.material(role),
+    );
+    m.rotation.x = Math.PI / 2; // three cylinders are y-axis; we need z-axis
+    m.castShadow = true;
+    m.receiveShadow = true;
+    return m;
+  }
+
+  /** Mirror the MJCF: nested groups, one per joint, meshes as in scene.xml. */
+  private buildArm(): void {
+    const base = new THREE.Group();
+    const baseMesh = this.cylinder(0.07, 0.1, "joint");
+    baseMesh.position.z = 0.05;
+    base.add(baseMesh);
+    this.ringMat = new THREE.MeshStandardMaterial({
+      color: 0x1a9a62, emissive: 0x1a9a62, emissiveIntensity: 0.35, roughness: 0.35, metalness: 0.2,
+    });
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.09, 0.011, 14, 48), this.ringMat);
+    ring.position.z = 0.018;
+    ring.castShadow = true;
+    base.add(ring);
+    this.scene.add(base);
+
+    const linkSpecs: ((g: THREE.Group) => void)[] = [
+      (g) => {
+        const m = this.cylinder(0.055, 0.08, "joint");
+        m.position.z = 0.04;
+        g.add(m);
+      },
+      (g) => {
+        const m = this.cylinder(0.042, 0.3, "shell");
+        m.position.z = 0.15;
+        g.add(m);
+      },
+      (g) => {
+        const m = this.cylinder(0.036, 0.25, "shell");
+        m.position.z = 0.125;
+        g.add(m);
+      },
+      (g) => {
+        const m = this.cylinder(0.045, 0.06, "joint");
+        m.position.z = 0.03;
+        g.add(m);
+      },
+      (g) => {
+        const m = this.cylinder(0.04, 0.06, "joint");
+        m.position.z = 0.03;
+        g.add(m);
+      },
+      (g) => {
+        const palm = this.box(0.08, 0.05, 0.04, "joint");
+        palm.position.z = 0.02;
+        g.add(palm);
+        this.fingerL = this.box(0.02, 0.012, 0.08, "shell");
+        this.fingerR = this.box(0.02, 0.012, 0.08, "shell");
+        g.add(this.fingerL, this.fingerR);
+        this.eyeMat = new THREE.MeshStandardMaterial({
+          color: CYAN, emissive: CYAN, emissiveIntensity: 0.85, roughness: 0.25,
+        });
+        for (const y of [-0.016, 0.016]) {
+          const eye = new THREE.Mesh(new THREE.SphereGeometry(0.008, 16, 12), this.eyeMat);
+          eye.position.set(0, y, 0.048);
+          g.add(eye);
+        }
+      },
+    ];
+
+    let parent: THREE.Object3D = base;
+    for (let i = 0; i < CHAIN.length; i++) {
+      const g = new THREE.Group();
+      const [ox, oy, oz] = CHAIN[i].offset;
+      g.position.set(ox, oy, oz);
+      linkSpecs[i](g);
+      parent.add(g);
+      this.jointGroups.push(g);
+      parent = g;
+    }
+  }
+
+  private buildObjects(): void {
+    const { trayCenter } = SCENE;
+    const trayParts: [Vec3, Vec3][] = [
+      // [half extents, local position]
+      [[0.09, 0.09, 0.006], [0, 0, 0.006]],
+      [[0.09, 0.006, 0.025], [0, 0.084, 0.025]],
+      [[0.09, 0.006, 0.025], [0, -0.084, 0.025]],
+      [[0.006, 0.09, 0.025], [0.084, 0, 0.025]],
+      [[0.006, 0.09, 0.025], [-0.084, 0, 0.025]],
+    ];
+    for (const [half, local] of trayParts) {
+      const mesh = this.box(half[0] * 2, half[1] * 2, half[2] * 2, "tray");
+      mesh.position.set(
+        trayCenter[0] + local[0],
+        trayCenter[1] + local[1],
+        trayCenter[2] + local[2],
+      );
+      this.scene.add(mesh);
+      this.world.createCollider(
+        RAPIER.ColliderDesc.cuboid(...half)
+          .setTranslation(mesh.position.x, mesh.position.y, mesh.position.z)
+          .setFriction(1.0),
+      );
+    }
+
+    SCENE.cubeStarts.forEach((pos) => this.spawnCube(pos));
+  }
+
+  private spawnCube(pos: Vec3): void {
+    const body = this.world.createRigidBody(
+      RAPIER.RigidBodyDesc.dynamic().setTranslation(...pos).setCcdEnabled(true),
+    );
+    this.world.createCollider(
+      RAPIER.ColliderDesc.cuboid(SCENE.cubeHalf, SCENE.cubeHalf, SCENE.cubeHalf)
+        .setDensity(750)
+        .setFriction(1.0),
+      body,
+    );
+    const side = SCENE.cubeHalf * 2;
+    const mesh = this.box(side, side, side, "shell");
+    const material = mesh.material as THREE.MeshStandardMaterial;
+    this.shellMats.pop();
+    material.emissive.setHex(0xffffff);
+    material.emissiveIntensity = 0;
+    this.scene.add(mesh);
+    this.cubes.push({ body, mesh, material, held: false });
+  }
+
+  private buildMarkers(): void {
+    const targetMat = new THREE.MeshBasicMaterial({ color: 0x1a9a62, transparent: true, opacity: 0.6 });
+    this.markerMats.push(targetMat);
+    this.targetMarker = new THREE.Mesh(new THREE.SphereGeometry(0.015), targetMat);
+    this.scene.add(this.targetMarker);
+
+    // Depth cue: a ring on the floor directly under the tool plus a drop
+    // line up to it, so the operator can judge x/y without a second view.
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: 0x1a9a62, transparent: true, opacity: 0.7, depthWrite: false,
+    });
+    this.markerMats.push(ringMat);
+    this.floorRing = new THREE.Mesh(new THREE.RingGeometry(0.018, 0.026, 32), ringMat);
+    this.scene.add(this.floorRing);
+    this.dropLine = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(), new THREE.Vector3(),
+      ]),
+      new THREE.LineBasicMaterial({
+        color: 0x1a9a62, transparent: true, opacity: 0.35, depthWrite: false,
+      }),
+    );
+    this.markerMats.push(this.dropLine.material as THREE.Material);
+    this.dropLine.frustumCulled = false;
+    this.scene.add(this.dropLine);
+  }
+
+  /** Recolor visible materials from the page theme. Joint frames stay put. */
+  applyTheme(): void {
+    const dark = themeIsDark();
+    const primary = tokenHex("--primary", 0x1a9a62);
+    const background = tokenHex("--background", dark ? 0x121416 : 0xf7f7f7);
+    const card = tokenHex("--card", dark ? 0x1c1c1c : 0xf3f3f3);
+    const muted = tokenHex("--muted", dark ? 0x2a2a2a : 0xededed);
+    const border = tokenHex("--border", dark ? 0x333333 : 0xdcdcdc);
+    const cubeA = tokenHex("--chart-2", CUBE_FALLBACK[0]);
+    const cubeB = tokenHex("--chart-4", CUBE_FALLBACK[1]);
+    const bg = new THREE.Color(background);
+
+    this.scene.background = bg;
+    this.scene.fog = new THREE.Fog(background, 2.5, 6);
+    this.hemi.color.setHex(0xffffff);
+    this.hemi.groundColor.setHex(dark ? 0x123028 : 0xd5ebe4);
+    this.hemi.intensity = dark ? 0.85 : 1.2;
+
+    for (const mat of this.shellMats) {
+      mat.color.setHex(SHELL);
+      mat.emissive.setHex(0x000000);
+      mat.emissiveIntensity = 0;
+      mat.roughness = 0.32;
+      mat.metalness = 0.06;
+    }
+    for (const mat of this.jointMats) {
+      mat.color.setHex(dark ? JOINT_DARK : JOINT_LIGHT);
+      mat.emissive.setHex(primary);
+      mat.emissiveIntensity = dark ? 0.16 : 0;
+      mat.roughness = 0.42;
+      mat.metalness = 0.48;
+    }
+    const floors = dark ? [background, card] : [muted, border];
+    this.floorMats.forEach((mat, i) => mat.color.setHex(floors[i] ?? floors[0]));
+    for (const mat of this.trayMats) {
+      mat.color.setHex(dark ? 0x3a414c : 0xd5d8de);
+      mat.roughness = 0.62;
+      mat.metalness = dark ? 0.28 : 0.08;
+    }
+    this.ringMat.color.setHex(primary);
+    this.ringMat.emissive.setHex(primary);
+    this.ringMat.emissiveIntensity = dark ? 0.55 : 0.18;
+    this.eyeMat.color.setHex(CYAN);
+    this.eyeMat.emissive.setHex(CYAN);
+    this.eyeMat.emissiveIntensity = dark ? 1.05 : 0.4;
+    for (const mat of this.markerMats) {
+      if (mat instanceof THREE.MeshBasicMaterial || mat instanceof THREE.LineBasicMaterial) {
+        mat.color.setHex(primary);
+      }
+    }
+    this.cubes.forEach((cube, i) => {
+      const hex = i % 2 === 0 ? cubeA : cubeB;
+      cube.material.color.setHex(hex);
+      cube.material.emissive.setHex(hex);
+    });
+  }
+
+  // ---------------- commands (same interface as the Python ArmSim) ----------------
+
+  setJointTargets(q: number[]): void {
+    this.q = [...q];
+  }
+
+  /** opening in [0, 1]: 0 = fully closed, 1 = fully open. */
+  setGripper(opening: number): void {
+    this.grip = Math.min(Math.max(opening, 0), 1);
+  }
+
+  setTargetMarker(pos: Vec3): void {
+    this.targetMarker.position.set(...pos);
+  }
+
+  reset(): void {
+    // Reopen the gripper, or a closed grip re-grasps a freshly reset cube
+    // that spawns within GRASP_RADIUS on the next step.
+    this.grip = 1;
+    this.cubes.forEach((cube, i) => {
+      this.release(cube, false);
+      const [x, y, z] = SCENE.cubeStarts[i];
+      cube.body.setTranslation({ x, y, z }, true);
+      cube.body.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+      cube.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      cube.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    });
+  }
+
+  /** Current cube centers, world frame, in spawn order. */
+  cubePositions(): Vec3[] {
+    return this.cubes.map((c) => {
+      const t = c.body.translation();
+      return [t.x, t.y, t.z];
+    });
+  }
+
+  get holding(): boolean {
+    return this.cubes.some((c) => c.held);
+  }
+
+  /** True if the open gripper is over a cube it could grasp right now. */
+  get canGrasp(): boolean {
+    return this.candidate !== null;
+  }
+
+  // ---------------- stepping ----------------
+
+  step(wallDt: number): void {
+    // Arm pose (kinematic).
+    for (let i = 0; i < 6; i++) {
+      const g = this.jointGroups[i];
+      g.rotation.set(0, 0, 0);
+      if (CHAIN[i].axis === "z") g.rotation.z = this.q[i];
+      else g.rotation.y = this.q[i];
+    }
+    const slide = 0.005 + this.grip * 0.035;
+    this.fingerL.position.set(0, 0.008 + slide + 0.006, 0.08);
+    this.fingerR.position.set(0, -0.008 - slide - 0.006, 0.08);
+
+    const f = fk(this.q);
+    const fPrev = this.prevF ?? f;
+    this.updateGrasp(f);
+
+    // Physics at a fixed rate with capped catch-up (same policy as ArmSim).
+    // The held cube's servo target is interpolated across the substeps so
+    // a frame's worth of arm motion is spread over them instead of landing
+    // in the first one.
+    this.accumulator = Math.min(this.accumulator + wallDt, 0.1);
+    const h = 1 / PHYSICS_HZ;
+    const n = Math.floor(this.accumulator / h);
+    for (let i = 1; i <= n; i++) {
+      this.driveHeld(fPrev, f, i / n, h);
+      this.world.step();
+    }
+    this.accumulator -= n * h;
+    this.prevF = f;
+
+    for (const cube of this.cubes) {
+      const t = cube.body.translation();
+      const r = cube.body.rotation();
+      cube.mesh.position.set(t.x, t.y, t.z);
+      cube.mesh.quaternion.set(r.x, r.y, r.z, r.w);
+    }
+
+    this.floorRing.position.set(f.pos[0], f.pos[1], 0.002);
+    const line = this.dropLine.geometry.getAttribute("position") as THREE.BufferAttribute;
+    line.setXYZ(0, f.pos[0], f.pos[1], 0.002);
+    line.setXYZ(1, f.pos[0], f.pos[1], f.pos[2]);
+    line.needsUpdate = true;
+  }
+
+  /** Servo held cubes toward their tool-frame pose for one substep. */
+  private driveHeld(fPrev: FKResult, f: FKResult, alpha: number, h: number): void {
+    for (const cube of this.cubes) {
+      if (!cube.held || !cube.holdOffset) continue;
+      const pos: Vec3 = [
+        fPrev.pos[0] + (f.pos[0] - fPrev.pos[0]) * alpha,
+        fPrev.pos[1] + (f.pos[1] - fPrev.pos[1]) * alpha,
+        fPrev.pos[2] + (f.pos[2] - fPrev.pos[2]) * alpha,
+      ];
+      const quat = quatSlerp(fPrev.quat, f.quat, alpha);
+      const want = vecAdd(pos, matVec3(matrixFromQuat(quat), cube.holdOffset.pos));
+      const wantQuat = quatMultiply(quat, cube.holdOffset.quat);
+
+      const t = cube.body.translation();
+      const v = vecClampNorm(
+        [(want[0] - t.x) / h, (want[1] - t.y) / h, (want[2] - t.z) / h],
+        HELD_MAX_SPEED,
+      );
+      cube.body.setLinvel({ x: v[0], y: v[1], z: v[2] }, true);
+
+      const r = cube.body.rotation();
+      const e = orientationError(wantQuat, [r.x, r.y, r.z, r.w]);
+      const w = vecClampNorm([e[0] / h, e[1] / h, e[2] / h], HELD_MAX_ANGVEL);
+      cube.body.setAngvel({ x: w[0], y: w[1], z: w[2] }, true);
+    }
+  }
+
+  private grasp(cube: Cube, f: FKResult, rel: Vec3): void {
+    cube.held = true;
+    // Store the cube pose in the tool frame.
+    const localPos = matVec3(matTranspose3(f.rot), rel) as Vec3;
+    const r = cube.body.rotation();
+    const localQuat = quatMultiply(quatConjugate(f.quat), [r.x, r.y, r.z, r.w]);
+    cube.holdOffset = { pos: localPos, quat: localQuat };
+    cube.body.setGravityScale(0, true); // the servo carries it; no sag
+    cube.material.emissiveIntensity = 0;
+  }
+
+  private release(cube: Cube, keepVelocity: boolean): void {
+    if (!cube.held) return;
+    cube.held = false;
+    cube.holdOffset = undefined;
+    cube.body.setGravityScale(1, true);
+    // Drop, don't fling: cap the carried-over speed and shed the wrist's
+    // spin, which the servo can leave at tens of rad/s.
+    const lv = cube.body.linvel();
+    const v: Vec3 = keepVelocity
+      ? vecClampNorm([lv.x, lv.y, lv.z], RELEASE_MAX_SPEED)
+      : [0, 0, 0];
+    cube.body.setLinvel({ x: v[0], y: v[1], z: v[2] }, true);
+    cube.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+  }
+
+  private updateGrasp(f: FKResult): void {
+    const closed = this.grip < SCENE.graspClosedAperture;
+    // Nearest cube within reach of the tool, for the grasp and the glow.
+    let nearest: Cube | null = null;
+    let nearestRel: Vec3 = [0, 0, 0];
+    let nearestDist = SCENE.graspRadius;
+    for (const cube of this.cubes) {
+      const t = cube.body.translation();
+      const rel = vecSub([t.x, t.y, t.z], f.pos);
+      const d = vecNorm(rel);
+      if (d < nearestDist) {
+        nearest = cube;
+        nearestRel = rel;
+        nearestDist = d;
+      }
+    }
+
+    if (closed) {
+      if (!this.holding && nearest) this.grasp(nearest, f, nearestRel);
+    } else {
+      for (const cube of this.cubes) this.release(cube, true);
+    }
+
+    // Glow the cube a pinch would pick up (open gripper, nothing held).
+    const candidate = !closed && !this.holding ? nearest : null;
+    if (candidate !== this.candidate) {
+      if (this.candidate) this.candidate.material.emissiveIntensity = 0;
+      if (candidate) candidate.material.emissiveIntensity = HIGHLIGHT_INTENSITY;
+      this.candidate = candidate;
+    }
+  }
+
+  render(width: number, height: number): void {
+    if (this.contextLost) throw new Error("WebGL context lost");
+    const size = this.renderer.getSize(new THREE.Vector2());
+    if (size.x !== width || size.y !== height) {
+      this.renderer.setSize(width, height, false);
+      this.camera.aspect = width / height;
+      this.camera.updateProjectionMatrix();
+    }
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  /** Free GPU and physics resources so a fresh scene can take the canvas. */
+  dispose(): void {
+    this.renderer.dispose();
+    this.world.free();
+  }
+}

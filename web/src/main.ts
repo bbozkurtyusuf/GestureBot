@@ -1,0 +1,662 @@
+/**
+ * Bootstrap and render loop.
+ *
+ * Two ways to drive the arm share one loop: the camera (hand -> tracker ->
+ * controller) and the autopilot (scripted targets -> controller), both
+ * ending in the same IK -> command -> physics -> render path.
+ */
+
+import "./style.css";
+import { TeleopController } from "./app";
+import type { ArmScene } from "./armScene";
+import type { Autopilot } from "./autopilot";
+import type { HandObservation, HandTracker, ProgressFn } from "./handTracker";
+import { HAND_CONNECTIONS, type Landmarks } from "./poseFeatures";
+
+const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
+const video = $<HTMLVideoElement>("video");
+const overlay = $<HTMLCanvasElement>("overlay");
+const simCanvas = $<HTMLCanvasElement>("sim");
+const hud = $<HTMLDivElement>("hud");
+const landing = $<HTMLDivElement>("landing");
+const landingStatus = $<HTMLParagraphElement>("landing-status");
+const landingProgress = $<HTMLProgressElement>("landing-progress");
+const startBtn = $<HTMLButtonElement>("start");
+const autopilotBtn = $<HTMLButtonElement>("btn-autopilot");
+const camPlaceholder = $<HTMLDivElement>("cam-placeholder");
+const takeoverBtn = $<HTMLButtonElement>("btn-takeover");
+const takeoverStatus = $<HTMLParagraphElement>("takeover-status");
+const btnCal = $<HTMLButtonElement>("btn-calibrate");
+const btnOri = $<HTMLButtonElement>("btn-orientation");
+const btnFreeze = $<HTMLButtonElement>("btn-freeze");
+const btnReset = $<HTMLButtonElement>("btn-reset");
+
+class RollingMean {
+  private buf: number[] = [];
+  constructor(private n = 60) {}
+  push(v: number): void {
+    this.buf.push(v);
+    if (this.buf.length > this.n) this.buf.shift();
+  }
+  mean(): number {
+    return this.buf.length
+      ? this.buf.reduce((s, v) => s + v, 0) / this.buf.length
+      : 0;
+  }
+}
+
+const detectMs = new RollingMean();
+const tickMs = new RollingMean();
+const frameMs = new RollingMean();
+
+// ---------------- engine loading ----------------
+
+/**
+ * Heavy modules are loaded on demand (the landing shell stays a small
+ * entry chunk) and created once, then reused across sessions: a second
+ * ArmScene would attach a second WebGLRenderer to the same canvas and
+ * leak the Rapier world; a second HandLandmarker leaks its predecessor.
+ * The scene and the tracker load separately so the autopilot never pays
+ * for the ~20 MB of hand-tracking wasm + model it doesn't use.
+ */
+let scenePromise: Promise<ArmScene> | null = null;
+let trackerPromise: Promise<HandTracker> | null = null;
+/** Whoever is currently showing a loading UI receives model progress. */
+let progressListener: ProgressFn | null = null;
+
+function loadScene(): Promise<ArmScene> {
+  scenePromise ??= import("./armScene")
+    .then(({ ArmScene }) => ArmScene.create(simCanvas))
+    .catch((e) => {
+      scenePromise = null; // allow a clean retry
+      throw e;
+    });
+  return scenePromise;
+}
+
+function loadTracker(): Promise<HandTracker> {
+  trackerPromise ??= import("./handTracker")
+    .then(({ HandTracker }) => HandTracker.create((l, t) => progressListener?.(l, t)))
+    .catch((e) => {
+      trackerPromise = null;
+      throw e;
+    });
+  return trackerPromise;
+}
+
+/** Tear the engine down so the next start builds a fresh one. */
+function discardEngine(): void {
+  const s = scenePromise;
+  const t = trackerPromise;
+  scenePromise = null;
+  trackerPromise = null;
+  s?.then((scene) => scene.dispose()).catch(() => {});
+  t?.then((tracker) => tracker.close()).catch(() => {});
+}
+
+// ---------------- sessions ----------------
+
+type Session =
+  | { mode: "hand"; ctl: TeleopController; scene: ArmScene; stream: MediaStream }
+  | { mode: "autopilot"; ctl: TeleopController; scene: ArmScene; autopilot: Autopilot };
+
+/** The running session, if any — event handlers wired once refer to this. */
+let active: Session | null = null;
+
+/**
+ * Tear down the running session. `next` is the session about to replace
+ * it, if any: a hand session has already attached its stream to the video
+ * element by the time it gets here, so that stream must survive the
+ * teardown — clearing srcObject unconditionally blanks the camera panel
+ * and stops MediaPipe from ever seeing a frame.
+ */
+function endSession(next?: Session): void {
+  const keep = next?.mode === "hand" ? next.stream : null;
+  if (active?.mode === "hand" && active.stream !== keep) {
+    active.stream.getTracks().forEach((t) => t.stop());
+  }
+  active = null;
+  if (video.srcObject !== keep) video.srcObject = null;
+  camPlaceholder.hidden = true;
+  takeoverStatus.textContent = "";
+  overlay.getContext("2d")?.clearRect(0, 0, overlay.width, overlay.height);
+}
+
+function stopToLanding(message: string): void {
+  endSession();
+  landing.classList.remove("hidden");
+  setLoading(message, null);
+  startBtn.disabled = false;
+  autopilotBtn.disabled = false;
+  for (const b of [btnCal, btnOri, btnFreeze, btnReset]) b.disabled = true;
+  btnFreeze.classList.remove("active");
+}
+
+function setLoading(text: string, frac: number | null): void {
+  landingStatus.textContent = text;
+  landingProgress.hidden = frac === null;
+  if (frac !== null) landingProgress.value = frac;
+}
+
+function enterSession(s: Session): void {
+  endSession(s);
+  active = s;
+  landing.classList.add("hidden");
+  setLoading("", null);
+  startBtn.disabled = false;
+  autopilotBtn.disabled = false;
+  camPlaceholder.hidden = s.mode !== "autopilot";
+  // Calibration and orientation only mean something with a hand.
+  btnCal.disabled = btnOri.disabled = s.mode !== "hand";
+  btnFreeze.disabled = btnReset.disabled = false;
+  btnFreeze.classList.remove("active");
+  btnOri.textContent = `Yönelim: ${s.ctl.orientationOn ? "açık" : "kapalı"}`;
+}
+
+// ---------------- drawing ----------------
+
+/** Cap the backing store like the Three.js renderer does. */
+const dpr = (): number => Math.min(window.devicePixelRatio || 1, 2);
+
+/**
+ * Size the overlay to the panel (in device pixels) only when it changed:
+ * assigning canvas width/height clears the bitmap and resets context state
+ * even when the value is identical, so an unconditional per-frame write
+ * costs a backing-store clear plus a forced layout.
+ */
+function sizeOverlay(panelW: number, panelH: number): void {
+  const w = Math.round(panelW * dpr());
+  const h = Math.round(panelH * dpr());
+  if (overlay.width !== w) overlay.width = w;
+  if (overlay.height !== h) overlay.height = h;
+}
+
+/** Keypoint fill follows --primary. Canvas and Three.js need a resolved rgb. */
+const THEME_KEY = "gesturebot-theme";
+let accentFill = "rgb(26, 154, 98)";
+const SKELETON = "rgba(34, 211, 238, 0.92)";
+const SKELETON_FROZEN = "rgba(255, 92, 92, 0.92)";
+
+const STATUS_TR: Record<string, string> = {
+  starting: "başlıyor",
+  resting: "dinleniyor",
+  done: "bitti",
+  "reaching for the cube": "küpe uzanıyor",
+  descending: "alçalıyor",
+  "closing the gripper": "kıskaç kapanıyor",
+  lifting: "kaldırıyor",
+  "carrying to the tray": "tepsiye taşıyor",
+  lowering: "indiriyor",
+  releasing: "bırakıyor",
+  retreating: "geri çekiliyor",
+};
+
+function trStatus(status: string): string {
+  return STATUS_TR[status] ?? status;
+}
+
+function refreshAccent(): void {
+  const probe = document.createElement("span");
+  probe.style.color = "var(--primary)";
+  document.documentElement.appendChild(probe);
+  const computed = getComputedStyle(probe).color;
+  probe.remove();
+  if (computed) accentFill = computed;
+}
+
+function syncFavicon(): void {
+  const dark = document.documentElement.classList.contains("dark");
+  document.getElementById("favicon")?.setAttribute(
+    "href",
+    dark ? "/brand/gesturebot-dark.png" : "/brand/gesturebot-light.png",
+  );
+}
+
+function applyPageTheme(dark: boolean): void {
+  document.documentElement.classList.toggle("dark", dark);
+  try {
+    localStorage.setItem(THEME_KEY, dark ? "dark" : "light");
+  } catch {
+    /* private mode */
+  }
+  syncFavicon();
+  refreshAccent();
+  scenePromise?.then((scene) => scene.applyTheme()).catch(() => {});
+}
+
+function drawSkeleton(lm: Landmarks, frozen: boolean): void {
+  const ctx = overlay.getContext("2d")!;
+  const { width: w, height: h } = overlay;
+  ctx.clearRect(0, 0, w, h);
+  // The video fills the panel with object-fit: cover, so the rendered
+  // frame is scaled by max(w/videoW, h/videoH) and center-cropped; project
+  // the normalized landmarks through that same transform or the skeleton
+  // drifts off the hand toward the panel edges.
+  const vw = video.videoWidth || 1;
+  const vh = video.videoHeight || 1;
+  const scale = Math.max(w / vw, h / vh);
+  const dispW = vw * scale;
+  const dispH = vh * scale;
+  const offX = (dispW - w) / 2;
+  const offY = (dispH - h) / 2;
+  const px = (p: readonly number[]): [number, number] => [
+    p[0] * dispW - offX,
+    p[1] * dispH - offY,
+  ];
+  ctx.lineWidth = 2.5 * dpr();
+  ctx.strokeStyle = frozen ? SKELETON_FROZEN : SKELETON;
+  for (const [a, b] of HAND_CONNECTIONS) {
+    ctx.beginPath();
+    ctx.moveTo(...px(lm[a]));
+    ctx.lineTo(...px(lm[b]));
+    ctx.stroke();
+  }
+  ctx.fillStyle = accentFill;
+  for (const p of lm) {
+    ctx.beginPath();
+    ctx.arc(...px(p), 4 * dpr(), 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+/** One HUD line is a list of text runs, optionally styled. */
+type Run = { t: string; c?: "warn" | "good" | "muted" };
+
+let lastHudKey = "";
+
+/**
+ * Render the HUD from text runs (no innerHTML: nothing here is markup,
+ * and this keeps the page CSP-clean). Skipped when nothing changed.
+ */
+function renderHud(lines: Run[][]): void {
+  const key = JSON.stringify(lines);
+  if (key === lastHudKey) return;
+  lastHudKey = key;
+  const frag = document.createDocumentFragment();
+  lines.forEach((runs, i) => {
+    if (i > 0) frag.append("\n");
+    for (const r of runs) {
+      if (!r.c) {
+        frag.append(r.t);
+        continue;
+      }
+      const span = document.createElement("span");
+      span.className = r.c;
+      span.textContent = r.t;
+      frag.append(span);
+    }
+  });
+  hud.replaceChildren(frag);
+}
+
+function progressBar(frac: number, width = 10): string {
+  const filled = Math.round(Math.min(Math.max(frac, 0), 1) * width);
+  return "▮".repeat(filled) + "▯".repeat(width - filled);
+}
+
+function updateHud(s: Session, handVisible: boolean): void {
+  const { ctl, scene } = s;
+  const ik = ctl.lastIK;
+  const fps = frameMs.mean() > 0 ? 1000 / frameMs.mean() : 0;
+  const mode: Run = ctl.manualFreeze
+    ? { t: "DONDURULDU (düğme)", c: "warn" }
+    : s.mode === "autopilot"
+      ? { t: `OTOMATİK — ${trStatus(s.autopilot.status)}`, c: "good" }
+      : ctl.clutched
+        ? { t: "KAVRAMA (yumruk) — devam için elini aç", c: "warn" }
+        : { t: ctl.orientationOn ? "konum + yönelim" : "yalnızca konum" };
+  const grip: Run = ctl.gripLatched
+    ? { t: "KİLİTLİ", c: "warn" }
+    : ctl.gripping || (s.mode === "autopilot" && ctl.gripOpening < 0.5)
+      ? { t: "KAPALI", c: "warn" }
+      : { t: "açık" };
+  const timing = s.mode === "hand"
+    ? `fps ${fps.toFixed(0).padStart(3)}   algı ${detectMs.mean().toFixed(1)} ms   adım ${tickMs.mean().toFixed(2)} ms`
+    : `fps ${fps.toFixed(0).padStart(3)}   adım ${tickMs.mean().toFixed(2)} ms`;
+  const lines: Run[][] = [[{ t: timing }], [{ t: "mod: " }, mode]];
+  if (s.mode === "hand") {
+    lines.push([
+      { t: "el: " },
+      handVisible ? { t: "izleniyor", c: "good" } : { t: "BULUNAMADI", c: "warn" },
+    ]);
+  }
+  lines.push([
+    { t: "kavrama: " }, grip, { t: `  açıklık ${ctl.gripOpening.toFixed(2)}` },
+    ...(scene.holding ? [{ t: "  ● küp tutuluyor", c: "good" as const }] : []),
+  ]);
+  if (ik) {
+    lines.push([
+      { t: `ik: ${ik.iters} it  ${(ik.posErr * 1000).toFixed(1)} mm / ${((ik.oriErr * 180) / Math.PI).toFixed(1)} deg  w ${ik.manipulability.toFixed(3)}` },
+      ...(ik.converged ? [] : [{ t: " (!)", c: "warn" as const }]),
+    ]);
+  }
+  if (s.mode === "autopilot") {
+    lines.push([{ t: "el kontrolüyle aynı ters kinematik ve fizik — devralmak için kamerayı aç", c: "muted" }]);
+  } else if (!ctl.calibrated) {
+    lines.push([
+      handVisible
+        ? { t: `kilit için sabit dur  ${progressBar(ctl.calibProgress)}`, c: "warn" }
+        : { t: "açık elini kameraya göster", c: "warn" },
+    ]);
+  } else if (scene.holding) {
+    lines.push([{ t: "bırakmak için elini aç", c: "muted" }]);
+  } else if (scene.canGrasp) {
+    lines.push([{ t: "küp menzilde — tutmak için çimdikle", c: "good" }]);
+  }
+  renderHud(lines);
+}
+
+// ---------------- the loop ----------------
+
+/**
+ * Drive one session at display rate. `frame` produces this tick's hand
+ * observation (null when none) after advancing the controller; the loop
+ * owns timing, drawing, the HUD, and crash handling.
+ */
+function runLoop(
+  s: Session,
+  frame: (dt: number, now: number) => HandObservation | null | "stop",
+): void {
+  let tPrev = performance.now();
+  const loop = (): void => {
+    // Any uncaught throw here (GPU context loss, wasm fault) would
+    // otherwise kill the rAF chain silently with the camera still live.
+    try {
+      if (active !== s) return; // superseded by another session
+      const now = performance.now();
+      frameMs.push(now - tPrev); // frame interval -> real display fps
+      const dt = Math.min((now - tPrev) / 1000, 0.1);
+      tPrev = now;
+
+      const obs = frame(dt, now);
+      if (obs === "stop") return;
+
+      const camPanel = video.parentElement!;
+      sizeOverlay(camPanel.clientWidth, camPanel.clientHeight);
+      if (obs) drawSkeleton(obs.imageLandmarks, s.ctl.frozen);
+      else overlay.getContext("2d")!.clearRect(0, 0, overlay.width, overlay.height);
+
+      const simPanel = simCanvas.parentElement!;
+      s.scene.render(simPanel.clientWidth, simPanel.clientHeight);
+
+      updateHud(s, obs !== null);
+      requestAnimationFrame(loop);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // A lost GPU context never comes back for this renderer; rebuild
+      // the engine on the next start instead of reusing a dead one.
+      if (/context lost/i.test(msg)) discardEngine();
+      stopToLanding(`Oturum çöktü (${msg}). Yeniden denemek için başlatın.`);
+    }
+  };
+  requestAnimationFrame(loop);
+}
+
+/** Treat the hand as lost if the camera stops delivering frames this long. */
+const STALLED_FRAME_MS = 1500;
+/** Rest with the cubes in the tray before the autopilot loops. */
+const ROUND_DONE_PAUSE_MS = 2500;
+
+function startupError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (err instanceof DOMException && err.name === "NotAllowedError") {
+    return "Kamera izni reddedildi. Tarayıcı site ayarlarından izin verip yeniden deneyin.";
+  }
+  if (err instanceof DOMException && err.name === "NotFoundError") {
+    return "Kamera bulunamadı. Bir kamera bağlayın veya erişime izin verip yeniden deneyin.";
+  }
+  if (/WebGL/i.test(msg)) {
+    return "Bu tarayıcıda WebGL yok (3B simülasyon için gerekli). Donanım hızlandırmalı Chrome, Edge veya Safari deneyin.";
+  }
+  return `Başlatılamadı: ${msg}`;
+}
+
+const mb = (bytes: number): string => (bytes / 1e6).toFixed(1);
+
+/** Camera-driven session. Can take over from a running autopilot. */
+async function start(): Promise<void> {
+  startBtn.disabled = true;
+  takeoverBtn.disabled = true;
+  const fromAutopilot = active?.mode === "autopilot";
+  // While the autopilot keeps running, report progress in its panel.
+  const status = (text: string, frac: number | null): void => {
+    if (fromAutopilot) takeoverStatus.textContent = text;
+    else setLoading(text, frac);
+  };
+  let stream: MediaStream | null = null;
+  try {
+    status("3B motor yükleniyor…", null);
+    const scene = await loadScene();
+    status("El izleyici yükleniyor…", null);
+    progressListener = (loaded, total) =>
+      status(
+        total
+          ? `El modeli iniyor  ${mb(loaded)} / ${mb(total)} MB`
+          : `El modeli iniyor  ${mb(loaded)} MB`,
+        total ? loaded / total : null,
+      );
+    const tracker = await loadTracker();
+    progressListener = null;
+
+    status("Kamera isteniyor…", null);
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await new Promise<void>((res, rej) => {
+      video.onloadedmetadata = () => res();
+      // A granted stream that never delivers metadata (stalled virtual
+      // camera) would otherwise hang the UI at "Requesting camera…" forever.
+      setTimeout(() => rej(new Error("Kamera akışı hazır olmadı.")), 10_000);
+    });
+    await video.play();
+
+    // Device unplugged / permission revoked mid-session: stop pretending
+    // the last observation is live.
+    let cameraLost = false;
+    stream.getVideoTracks()[0]?.addEventListener("ended", () => {
+      cameraLost = true;
+    });
+
+    if (fromAutopilot) scene.reset(); // hand the operator a fresh scene
+    const ctl = new TeleopController(scene);
+    ctl.frameAspect = video.videoWidth / video.videoHeight;
+    const s: Session = { mode: "hand", ctl, scene, stream };
+    enterSession(s);
+
+    let lastObs: HandObservation | null = null;
+    let lastFrameAt = performance.now();
+
+    // New-frame detection: requestVideoFrameCallback fires exactly once
+    // per delivered camera frame where supported; elsewhere fall back to
+    // watching currentTime, which some browsers quantize coarsely.
+    let newFrame = false;
+    let lastVideoTime = -1;
+    const hasRvfc = typeof video.requestVideoFrameCallback === "function";
+    const onVideoFrame = (): void => {
+      newFrame = true;
+      if (active === s) video.requestVideoFrameCallback(onVideoFrame);
+    };
+    if (hasRvfc) video.requestVideoFrameCallback(onVideoFrame);
+
+    runLoop(s, (dt, now) => {
+      if (cameraLost) {
+        stopToLanding("Kamera koptu — yeniden bağlanmak için başlatın.");
+        return "stop";
+      }
+      if (!hasRvfc && video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+        newFrame = true;
+      }
+      if (newFrame && video.readyState >= 2) {
+        newFrame = false;
+        lastFrameAt = now;
+        const t0 = performance.now();
+        lastObs = tracker.detect(video, now);
+        detectMs.push(performance.now() - t0);
+      } else if (now - lastFrameAt > STALLED_FRAME_MS) {
+        // No fresh frames: without this, a stalled camera keeps feeding the
+        // arm the last observation forever and the hold failsafe never fires.
+        lastObs = null;
+      }
+      const t1 = performance.now();
+      ctl.tick(lastObs, dt);
+      tickMs.push(performance.now() - t1);
+      return lastObs;
+    });
+  } catch (err) {
+    progressListener = null;
+    // Release the camera on any failure, or the indicator light stays on
+    // (and a retry would acquire a second stream) while the app looks dead.
+    stream?.getTracks().forEach((t) => t.stop());
+    if (active?.mode === "autopilot") {
+      // Keep the show running; report the problem where the button is.
+      takeoverStatus.textContent = startupError(err);
+      startBtn.disabled = false;
+    } else {
+      stopToLanding(startupError(err));
+    }
+  } finally {
+    takeoverBtn.disabled = false;
+  }
+}
+
+/** Scripted pick-and-place, no camera. */
+async function startAutopilot(): Promise<void> {
+  autopilotBtn.disabled = true;
+  try {
+    setLoading("3B motor yükleniyor…", null);
+    const [scene, { Autopilot }] = await Promise.all([loadScene(), import("./autopilot")]);
+    scene.reset();
+    const ctl = new TeleopController(scene);
+    const autopilot = new Autopilot(ctl, scene);
+    const s: Session = { mode: "autopilot", ctl, scene, autopilot };
+    enterSession(s);
+
+    let doneAt: number | null = null;
+    runLoop(s, (dt, now) => {
+      const t1 = performance.now();
+      autopilot.tick(dt);
+      tickMs.push(performance.now() - t1);
+      if (autopilot.roundComplete) {
+        doneAt ??= now;
+        if (now - doneAt > ROUND_DONE_PAUSE_MS) {
+          doneAt = null;
+          resetScene();
+        }
+      }
+      return null;
+    });
+  } catch (err) {
+    stopToLanding(startupError(err));
+  }
+}
+
+// ---------------- controls ----------------
+
+function resetScene(): void {
+  if (!active) return;
+  const { ctl, scene } = active;
+  scene.reset();
+  ctl.resetControl();
+  // Push the reset state to the scene immediately: while the lost-hand
+  // hold is active the controller stops commanding, and without this the
+  // cubes teleport home but the arm keeps its stale pose and grip.
+  scene.setJointTargets(ctl.qCmd);
+  scene.setGripper(ctl.gripOpening);
+  scene.setTargetMarker(ctl.targetPos);
+  if (active.mode === "autopilot") active.autopilot.restart();
+  btnFreeze.classList.remove("active");
+}
+
+/**
+ * Wired once at module load; handlers act on the current session via
+ * `active`, so a restart doesn't stack duplicate listeners.
+ */
+function wireControls(): void {
+  const toggleOrientation = (): void => {
+    if (active?.mode !== "hand") return;
+    active.ctl.orientationOn = !active.ctl.orientationOn;
+    btnOri.textContent = `Yönelim: ${active.ctl.orientationOn ? "açık" : "kapalı"}`;
+  };
+  const toggleFreeze = (): void => {
+    if (!active) return;
+    active.ctl.manualFreeze = !active.ctl.manualFreeze;
+    btnFreeze.classList.toggle("active", active.ctl.manualFreeze);
+  };
+  const recalibrate = (): void => {
+    if (active?.mode === "hand") active.ctl.requestCalibration();
+  };
+
+  btnCal.addEventListener("click", recalibrate);
+  btnOri.addEventListener("click", toggleOrientation);
+  btnFreeze.addEventListener("click", toggleFreeze);
+  btnReset.addEventListener("click", resetScene);
+
+  window.addEventListener("keydown", (e) => {
+    // Bare keys only: Cmd+C must copy, Ctrl+F must find, held keys no-op.
+    if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
+    if (e.key === "c") recalibrate();
+    else if (e.key === "o") toggleOrientation();
+    else if (e.key === "f") toggleFreeze();
+    else if (e.key === "x") resetScene();
+  });
+
+  // Track resolution changes (device rotation, browser downgrading the
+  // stream) or the aspect correction silently corrupts the depth axis.
+  video.addEventListener("resize", () => {
+    if (active?.mode === "hand" && video.videoHeight > 0) {
+      active.ctl.frameAspect = video.videoWidth / video.videoHeight;
+    }
+  });
+
+  const shell = document.getElementById("shell")!;
+  const syncFullscreen = (): void => {
+    const on = document.fullscreenElement === shell;
+    document.getElementById("btn-fullscreen")?.setAttribute("aria-pressed", String(on));
+  };
+  document.getElementById("btn-theme")?.addEventListener("click", () => {
+    applyPageTheme(!document.documentElement.classList.contains("dark"));
+  });
+  document.getElementById("btn-fullscreen")?.addEventListener("click", () => {
+    const run = document.fullscreenElement === shell
+      ? document.exitFullscreen()
+      : shell.requestFullscreen();
+    void run.catch(() => {});
+  });
+  document.addEventListener("fullscreenchange", syncFullscreen);
+
+  startBtn.addEventListener("click", () => void start());
+  takeoverBtn.addEventListener("click", () => void start());
+  autopilotBtn.addEventListener("click", () => void startAutopilot());
+
+  // Intent-based prefetch: hovering or focusing a start button is a good
+  // sign the ~30 MB engine download is about to be wanted, and starting
+  // it now makes the click feel instant without loading it for visitors
+  // who only came to read.
+  const prefetch = (btn: HTMLElement, load: () => Promise<unknown>): void => {
+    const once = (): void => {
+      load().catch(() => {}); // the click path reports errors
+    };
+    btn.addEventListener("pointerenter", once, { once: true });
+    btn.addEventListener("focus", once, { once: true });
+  };
+  prefetch(startBtn, () => Promise.all([loadScene(), loadTracker()]));
+  prefetch(autopilotBtn, loadScene);
+}
+
+function applyCredit(): void {
+  const name = (import.meta.env.VITE_STUDENT_NAME ?? "").trim();
+  const number = (import.meta.env.VITE_STUDENT_NUMBER ?? "").trim();
+  const student = document.getElementById("student-credit");
+  if (!student) return;
+  const line = [name, number].filter((part) => part.length > 0).join(" · ");
+  student.textContent = line;
+  student.hidden = line.length === 0;
+}
+
+applyCredit();
+refreshAccent();
+syncFavicon();
+wireControls();

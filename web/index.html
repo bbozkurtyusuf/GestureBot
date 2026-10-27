@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Everything is same-origin (MediaPipe wasm + model are vendored under
+      public/), so the policy can pin it: no third-party scripts, no
+      network destinations, which is what "video never leaves your
+      machine" means at the platform level. wasm-unsafe-eval is needed to
+      instantiate the MediaPipe and Rapier wasm modules; the ws: entries
+      are for Vite's dev-server HMR socket only.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: mediastream:; worker-src 'self' blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:*; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'"
+    />
+    <title>GestureBot</title>
+    <link id="favicon" rel="icon" href="/brand/gesturebot-light.png" />
+    <script src="/theme-init.js"></script>
+  </head>
+  <body>
+    <div id="shell">
+      <header class="topbar">
+        <div class="brand">
+          <h1 class="brand-title">
+            <img class="brand-logo brand-logo-light" src="/brand/gesturebot-light.png" alt="GestureBot" />
+            <img class="brand-logo brand-logo-dark" src="/brand/gesturebot-dark.png" alt="" />
+          </h1>
+          <p class="tagline">Görüntü makinenizden çıkmaz.</p>
+        </div>
+        <div class="credit">
+          <img src="/brand/aksaray.png" alt="Aksaray Üniversitesi" />
+          <div>
+            <p class="school">Aksaray Üniversitesi</p>
+            <p class="student" id="student-credit"></p>
+          </div>
+        </div>
+        <div class="top-actions">
+          <button id="btn-theme" class="btn" type="button" aria-label="Temayı değiştir">
+            <span class="when-light">Karanlık</span>
+            <span class="when-dark">Aydınlık</span>
+          </button>
+          <button id="btn-fullscreen" class="btn" type="button">
+            <span class="fs-enter">Tam ekran</span>
+            <span class="fs-exit">Tam ekrandan çık</span>
+          </button>
+        </div>
+      </header>
+
+      <div id="stage">
+        <div class="panel" id="cam-panel">
+          <video id="video" autoplay playsinline muted></video>
+          <canvas id="overlay"></canvas>
+          <div id="hud"></div>
+          <div id="cam-placeholder" hidden>
+            <p>Otomatik sürüş — kamera kapalı.</p>
+            <button id="btn-takeover" class="btn btn-primary" type="button">Kamerayı aç ve devral</button>
+            <p id="takeover-status"></p>
+          </div>
+        </div>
+        <div class="panel" id="sim-panel">
+          <canvas id="sim"></canvas>
+        </div>
+        <div id="landing">
+          <div id="landing-card">
+            <img class="landing-logo brand-logo-light" src="/brand/gesturebot-light.png" alt="" />
+            <img class="landing-logo brand-logo-dark" src="/brand/gesturebot-dark.png" alt="" />
+            <p class="landing-blurb">
+              Elinizle süren 6 eksenli bir kol. Ters kinematik ve fizik, tarayıcıda canlı çalışır.
+            </p>
+            <ul>
+              <li><b>Yarım saniye sabit durun</b>, kalibrasyon kilitlensin</li>
+              <li><b>Elinizi hareket ettirin</b>, kol 3B uzayda izler</li>
+              <li><b>Çimdikle</b> tutun, avuç içinizi eğin, bilek dönsün</li>
+              <li><b>Yumruk</b> kolu dondurur, açınca kaldığı yerden sürer</li>
+            </ul>
+            <div class="landing-actions">
+              <button id="start" class="btn btn-primary" type="button">Kamerayı aç ve başla</button>
+              <button id="btn-autopilot" class="btn" type="button" title="Aynı ters kinematik ve fizikle senaryolu alma-bırakma, kamera gerekmez">Kamerasız izle</button>
+            </div>
+            <p class="landing-tips">
+              Kalibrasyonda elin tamamı kadrajda kalsın. Tutuş için çimdiklenen parmaklar
+              kameraya görünsün; gizlenirse kavrama düşebilir.
+            </p>
+            <p id="landing-status"></p>
+            <progress id="landing-progress" max="1" value="0" hidden></progress>
+          </div>
+        </div>
+      </div>
+
+      <div id="controls">
+        <button id="btn-calibrate" class="btn" type="button" title="Şu anki el duruşunu nötr al (c)" disabled>Kalibre</button>
+        <button id="btn-orientation" class="btn" type="button" title="Bilek yönelimini aç veya kapat (o)" disabled>Yönelim: açık</button>
+        <button id="btn-freeze" class="btn" type="button" title="Kolu dondur (f)" disabled>Dondur</button>
+        <button id="btn-reset" class="btn" type="button" title="Sahneyi sıfırla (x)" disabled>Sahneyi sıfırla</button>
+      </div>
+
+      <footer class="site-footer">
+        <p>
+          <a href="https://github.com/bbozkurtyusuf/GestureBot">GestureBot</a>,
+          <a href="https://github.com/bbozkurtyusuf">Yusuf Bozkurt  </a>
+          tarafından MIT lisansı ile yayımlanmıştır. Bu sürüm Aksaray Üniversitesi için revize edilmiş
+          ve Aksiyon Soft tarafından kamuya açık olarak sergilenmektedir.
+        </p>
+      </footer>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
